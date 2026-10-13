@@ -1,0 +1,8 @@
+# maki-vim-mode: prompt-only vim mode for the maki TUI.
+#
+# run: clipboard probing (maki.fn.executable) and clipboard mirroring
+#   (maki.fn.jobstart/jobwait) when system_clipboard_register is set.
+# fs_read: maki.fn.executable PATH probing for clipboard tools.
+[permissions]
+run = true
+fs_read = true
