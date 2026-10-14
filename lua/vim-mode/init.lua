@@ -66,8 +66,8 @@
 --   system_clipboard_register = true is still accepted as clipboard = "all".
 --   mode_styles keys: normal/insert/replace/visual/visual_line; values are
 --   theme style names ("accent", "success", "warning", "error", "dim", ...).
---   Defaults: normal=warning, insert=success, replace=error,
---   visual(+line)=accent.
+--   Defaults: normal=success (green), insert=warning (yellow),
+--   replace=accent (orange), visual(+line)=error (red).
 --
 -- Key pipeline notes (verified against maki-ui/src/app/mod.rs):
 --   * Bindings are GLOBAL: they no-op cheaply when the input is not live
@@ -120,11 +120,11 @@ local cfg = {
 -- host hint store does not accept -- it keeps Vec<(String, String)> -- so
 -- plain semantic names are the ceiling here.
 local MODE_STYLES = {
-  normal = "warning", -- yellow-ish (todo_in_progress)
-  insert = "success", -- green-ish (todo_completed)
-  replace = "error", -- red
-  visual = "accent", -- orange-ish theme accent
-  visual_line = "accent",
+  normal = "success", -- green-ish (todo_completed)
+  insert = "warning", -- yellow-ish (todo_in_progress)
+  replace = "accent", -- orange-ish theme accent
+  visual = "error", -- red
+  visual_line = "error",
 }
 
 -- Clipboard mode resolution. An explicit clipboard value wins; otherwise
