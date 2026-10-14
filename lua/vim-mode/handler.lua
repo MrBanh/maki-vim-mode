@@ -24,10 +24,13 @@
 -- Replays run with st.replaying set: undo units are pushed, repeat is not
 -- re-recorded, and the key sequence tracker is untouched.
 --
--- Cut for v1 (mirrors the documented scope): visual mode, display (gj/gk
--- degrade to j/k), H/M/L viewport jumps, window navigation, search, system
--- clipboard, langmap, autocomplete, : commands (':' inserts '/' at column 0
--- and enters insert mode instead).
+-- Visual mode is emulated (no host selection API): the anchor lives in
+-- state (visual_anchor / visual_line_anchor), motions move the cursor, and
+-- operators consume the anchor..cursor span. The integration layer shows
+-- the range in the status hint. Cut list (mirrors the documented scope):
+-- display (gj/gk degrade to j/k), H/M/L viewport jumps, window
+-- navigation, search, system clipboard, langmap, autocomplete, : commands
+-- (':' inserts '/' at column 0 and enters insert mode instead).
 
 local motions = require("vim-mode.motions")
 local vstate = require("vim-mode.state")
@@ -158,6 +161,67 @@ local function enter_insert(st, buf, res, setup_edits, before)
   st.key_seq = {}
   st.insert_norepeat = st.insert_norepeat or false
   vstate.set_mode(st, "insert")
+end
+
+-- ---------------------------------------------------------------------------
+-- emulated visual mode (anchor in Lua; hint shows the range)
+-- ---------------------------------------------------------------------------
+
+-- Visual char span: inclusive of the char under the cursor, like vim.
+local function visual_char_span(buf, st)
+  local anchor = st.visual_anchor
+  if anchor == nil then
+    return nil
+  end
+  local s = math.min(anchor, buf.cursor)
+  local e = math.max(anchor, buf.cursor)
+  -- empty prompt: nothing selected
+  if s == e and #buf.text == 0 then
+    return nil
+  end
+  e = motions.char_next(buf.text, e)
+  if e <= s then
+    return nil
+  end
+  return { start = s, stop = e }
+end
+
+-- Visual-line span: whole lines from the anchor line through the cursor line.
+local function visual_line_span(buf, st)
+  if st.visual_line_anchor == nil then
+    return nil
+  end
+  local a_line = motions.line_start(buf.text, st.visual_line_anchor)
+  local c_line = motions.line_start(buf.text, buf.cursor)
+  local s = math.min(a_line, c_line)
+  local e = motions.line_end(buf.text, math.max(a_line, c_line))
+  if e <= s then
+    return nil
+  end
+  return { start = s, stop = e }
+end
+
+local function visual_span(buf, st)
+  if st.mode == "visual_line" then
+    return visual_line_span(buf, st)
+  end
+  return visual_char_span(buf, st)
+end
+
+-- Track visual navigation keys for dot-repeat.
+local function visual_track_key(st, key)
+  if st.replaying then
+    return
+  end
+  if st.visual_keys == nil then
+    st.visual_keys = {}
+  end
+  st.visual_keys[#st.visual_keys + 1] = key
+end
+
+-- Leave visual mode, clearing anchors but keeping dot-repeat recording.
+local function exit_visual(st)
+  vstate.set_mode(st, "normal")
 end
 
 -- ---------------------------------------------------------------------------
@@ -892,6 +956,129 @@ end
 -- normal mode dispatch (mirrors handler.ts dispatch, prompt subset)
 -- ---------------------------------------------------------------------------
 
+-- Apply a visual selection operator shared by y/d/c/x/s:
+-- linewise in visual_line, charwise in visual.
+local function visual_apply(st, buf, res, before, enter_insert_after)
+  local span = visual_span(buf, st)
+  local linewise = st.mode == "visual_line"
+  if span == nil then
+    exit_visual(st)
+    res.handled = true
+    return res
+  end
+  local slice = buf.text:sub(span.start + 1, span.stop)
+  local reg_text = slice
+  if linewise and slice ~= "" and slice:sub(-1) ~= "\n" then
+    reg_text = slice .. "\n"
+  end
+  st.register = { text = reg_text, linewise = linewise }
+  local keys = st.visual_keys
+  local was_line = st.mode == "visual_line"
+  -- linewise delete/change eats the trailing newline, matching dd/cc.
+  local del_span = span
+  if linewise then
+    local e = span.stop
+    if e < #buf.text and buf.text:sub(e + 1, e + 1) == "\n" then
+      e = e + 1
+    elseif span.start > 0 and span.stop >= #buf.text then
+      del_span = { start = span.start - 1, stop = span.stop }
+    end
+    if e ~= span.stop then
+      del_span = { start = span.start, stop = e }
+    end
+  end
+  if enter_insert_after then
+    apply_edit(buf, res, motions.delete_span(buf.text, del_span))
+    exit_visual(st)
+    enter_insert(st, buf, res, {}, before)
+    -- dot-repeat replays the visual navigation + the operator key.
+    if keys ~= nil and not st.replaying then
+      local setup = { "v" }
+      for _, k in ipairs(keys) do
+        setup[#setup + 1] = k
+      end
+      st.insert_setup_keys = setup
+    end
+    res.handled = true
+    return res
+  end
+  apply_edit(buf, res, motions.delete_span(buf.text, del_span))
+  exit_visual(st)
+  commit_change(st, buf, res, before)
+  -- dot-repeat: replay the visual navigation + the caller-tracked op key
+  -- (the key itself was tracked before visual_apply ran).
+  if keys ~= nil and not st.replaying then
+    local seq = { was_line and "V" or "v" }
+    for _, k in ipairs(keys) do
+      seq[#seq + 1] = k
+    end
+    st.rep = { kind = "keys", keys = seq }
+  end
+  st.key_seq = {}
+  res.handled = true
+  return res
+end
+
+-- Move the cursor for a visual-mode motion key. Returns true when the key
+-- was a motion (cursor moved/stayed, anchor kept, key tracked).
+local function visual_motion(st, buf, key, count)
+  for _ = 1, count do
+    if key == "h" or key == "left" then
+      buf.cursor = motions.move_left(buf.text, buf.cursor)
+    elseif key == "l" or key == "right" then
+      buf.cursor = motions.move_right(buf.text, buf.cursor)
+    elseif key == "j" or key == "down" then
+      local col = st.wanted_column
+      if col == nil then
+        col = motions.line_column(buf.text, buf.cursor)
+      end
+      buf.cursor = motions.move_line_down(buf.text, buf.cursor, col)
+      st.wanted_column = col
+    elseif key == "k" or key == "up" then
+      local col = st.wanted_column
+      if col == nil then
+        col = motions.line_column(buf.text, buf.cursor)
+      end
+      buf.cursor = motions.move_line_up(buf.text, buf.cursor, col)
+      st.wanted_column = col
+    elseif key == "w" then
+      buf.cursor = motions.move_word_next(buf.text, buf.cursor)
+    elseif key == "b" then
+      buf.cursor = motions.move_word_prev(buf.text, buf.cursor)
+    elseif key == "e" then
+      buf.cursor = motions.move_word_end(buf.text, buf.cursor)
+    elseif key == "W" then
+      buf.cursor = motions.move_big_word_next(buf.text, buf.cursor)
+    elseif key == "B" then
+      buf.cursor = motions.move_big_word_prev(buf.text, buf.cursor)
+    elseif key == "E" then
+      buf.cursor = motions.move_big_word_end(buf.text, buf.cursor)
+    elseif key == "0" then
+      buf.cursor = motions.move_line_beginning(buf.text, buf.cursor)
+    elseif key == "^" or key == "_" then
+      buf.cursor = motions.move_first_non_whitespace(buf.text, buf.cursor)
+    elseif key == "$" then
+      buf.cursor = motions.move_line_end(buf.text, buf.cursor)
+      st.wanted_column = "end"
+    elseif key == "{" then
+      buf.cursor = motions.move_previous_paragraph(buf.text, buf.cursor)
+    elseif key == "}" then
+      buf.cursor = motions.move_next_paragraph(buf.text, buf.cursor)
+    elseif key == "%" then
+      local target, ok = motions.move_matching_bracket(buf.text, buf.cursor)
+      if ok then
+        buf.cursor = target
+      end
+    elseif key == "G" then
+      buf.cursor = #buf.text
+    else
+      return false
+    end
+  end
+  snap_cursor(buf)
+  return true
+end
+
 local SCROLL_OF = {
   e = "line-down",
   y = "line-up",
@@ -900,6 +1087,436 @@ local SCROLL_OF = {
   f = "page-down",
   b = "page-up",
 }
+
+-- Visual-mode dispatch: extend the selection with motions, operate with
+-- y/d/c/x/s/p/r/u/U/~/J, toggle with v/V, swap ends with o. Dot-repeat
+-- replays the navigation keys plus the operator.
+local function dispatch_visual(st, buf, res, ev, before)
+  local key = ev.key
+  local ctrl = ev.ctrl
+
+  if key == "escape" and not ctrl then
+    exit_visual(st)
+    res.handled = true
+    res.cursor_only = true
+    return res
+  end
+
+  -- v toggles charwise off (or converts linewise to charwise);
+  -- V toggles linewise off (or converts charwise to linewise).
+  if key == "v" and not ctrl then
+    if st.mode == "visual" then
+      exit_visual(st)
+    else
+      st.mode = "visual"
+      st.visual_anchor = buf.cursor
+      st.visual_line_anchor = nil
+    end
+    res.handled = true
+    res.cursor_only = true
+    return res
+  end
+  if key == "V" and not ctrl then
+    if st.mode == "visual_line" then
+      exit_visual(st)
+    else
+      st.mode = "visual_line"
+      st.visual_line_anchor = motions.line_start(buf.text, buf.cursor)
+      st.visual_anchor = nil
+      buf.cursor = st.visual_line_anchor
+      snap_cursor(buf)
+    end
+    res.handled = true
+    res.cursor_only = true
+    return res
+  end
+
+  -- o swaps the active end with the anchor.
+  if key == "o" and not ctrl then
+    if st.mode == "visual_line" and st.visual_line_anchor ~= nil then
+      local cur_line = motions.line_start(buf.text, buf.cursor)
+      buf.cursor = st.visual_line_anchor
+      st.visual_line_anchor = cur_line
+    elseif st.visual_anchor ~= nil then
+      local cur = buf.cursor
+      buf.cursor = st.visual_anchor
+      st.visual_anchor = cur
+    end
+    snap_cursor(buf)
+    visual_track_key(st, key)
+    res.handled = true
+    res.cursor_only = true
+    return res
+  end
+
+  -- pending f/F/t/T find motion.
+  local pend = st.pending
+  if pend == "f" or pend == "F" or pend == "t" or pend == "T" then
+    if is_printable(ev) then
+      local forward = pend == "f" or pend == "t"
+      local till = pend == "t" or pend == "T"
+      local count = vstate.take_count(st, 1)
+      buf.cursor = motions.find_motion(buf.text, buf.cursor, ev.key, forward, till, count, false)
+      snap_cursor(buf)
+      visual_track_key(st, pend)
+      visual_track_key(st, ev.key)
+      st.last_find = { char = ev.key, forward = forward, till = till }
+      vstate.clear_pending(st)
+      if buf.cursor ~= before.cursor then
+        res.cursor_only = true
+      end
+      res.handled = true
+      return res
+    end
+    vstate.clear_pending(st)
+    res.handled = true
+    return res
+  end
+  if (key == "f" or key == "t" or key == "F" or key == "T") and not ctrl then
+    vstate.set_pending(st, key, st.count .. key)
+    res.handled = true
+    return res
+  end
+  if key == ";" and not ctrl then
+    local last = st.last_find
+    if last ~= nil then
+      buf.cursor = motions.find_motion(
+        buf.text, buf.cursor, last.char, last.forward, last.till, vstate.take_count(st, 1), true)
+      snap_cursor(buf)
+      visual_track_key(st, key)
+      if buf.cursor ~= before.cursor then
+        res.cursor_only = true
+      end
+    end
+    res.handled = true
+    return res
+  end
+  if key == "," and not ctrl then
+    local last = st.last_find
+    if last ~= nil then
+      buf.cursor = motions.find_motion(
+        buf.text, buf.cursor, last.char, not last.forward, last.till, vstate.take_count(st, 1), true)
+      snap_cursor(buf)
+      visual_track_key(st, key)
+      if buf.cursor ~= before.cursor then
+        res.cursor_only = true
+      end
+    end
+    res.handled = true
+    return res
+  end
+
+  -- i/a text objects: reselect to the object (vim visual behavior).
+  if not ctrl and (key == "i" or key == "a") then
+    local tag = "vi"
+    if key == "a" then
+      tag = "va"
+    end
+    vstate.set_pending(st, tag, tag)
+    res.handled = true
+    return res
+  end
+  if st.pending == "vi" or st.pending == "va" then
+    local around = st.pending == "va"
+    local obj_key = key
+    vstate.clear_pending(st)
+    local result = nil
+    if obj_key == "w" or obj_key == "W" then
+      local big = obj_key == "W"
+      result = motions.word_text_object_operation(buf.text, buf.cursor, around, big)
+    elseif obj_key == '"' or obj_key == "'" or obj_key == "`" then
+      result = motions.quote_text_object_operation(buf.text, buf.cursor, around, obj_key)
+    elseif obj_key == "(" or obj_key == ")" or obj_key == "[" or obj_key == "]"
+      or obj_key == "{" or obj_key == "}" or obj_key == "<" or obj_key == ">" then
+      result = motions.bracket_text_object_operation(buf.text, buf.cursor, around, obj_key, "v")
+    end
+    if result ~= nil and result.span ~= nil and result.span.stop > result.span.start then
+      st.mode = "visual"
+      st.visual_anchor = result.span.start
+      st.visual_line_anchor = nil
+      buf.cursor = result.span.stop - 1
+      snap_cursor(buf)
+      if around then
+        visual_track_key(st, "a")
+      else
+        visual_track_key(st, "i")
+      end
+      visual_track_key(st, obj_key)
+    end
+    res.handled = true
+    res.cursor_only = true
+    return res
+  end
+
+  -- yank: copy the span, back to normal.
+  if key == "y" and not ctrl then
+    local span = visual_span(buf, st)
+    local linewise = st.mode == "visual_line"
+    if span ~= nil then
+      local slice = buf.text:sub(span.start + 1, span.stop)
+      local reg_text = slice
+      if linewise and slice ~= "" and slice:sub(-1) ~= "\n" then
+        reg_text = slice .. "\n"
+      end
+      st.register = { text = reg_text, linewise = linewise }
+    end
+    local keys = st.visual_keys
+    local was_line = st.mode == "visual_line"
+    exit_visual(st)
+    if keys ~= nil and not st.replaying then
+      local seq = { was_line and "V" or "v" }
+      for _, k in ipairs(keys) do
+        seq[#seq + 1] = k
+      end
+      seq[#seq + 1] = "y"
+      st.rep = { kind = "keys", keys = seq }
+    end
+    st.key_seq = {}
+    res.handled = true
+    res.cursor_only = true
+    return res
+  end
+
+  -- operators that delete the selection (c/s enter insert after).
+  if not ctrl and (key == "d" or key == "x") then
+    visual_track_key(st, key)
+    return visual_apply(st, buf, res, before, false)
+  end
+  if not ctrl and (key == "c" or key == "s") then
+    visual_track_key(st, key)
+    return visual_apply(st, buf, res, before, true)
+  end
+
+  -- r: replace every selected char with the typed one.
+  if st.pending == "" and key == "r" and not ctrl then
+    vstate.set_pending(st, "r")
+    res.handled = true
+    return res
+  end
+  if st.pending == "r" then
+    if ctrl then
+      vstate.clear_pending(st)
+      res.handled = false
+      return res
+    end
+    if is_printable(ev) then
+      local value = ev.key
+      local span = visual_span(buf, st)
+      vstate.clear_pending(st)
+      if span ~= nil and span.stop > span.start then
+        local fill = string.rep(value, span.stop - span.start)
+        apply_edit(buf, res, {
+          start = span.start, stop = span.stop, text = fill, cursor = span.start,
+        })
+        local keys = st.visual_keys
+        exit_visual(st)
+        commit_change(st, buf, res, before)
+        if keys ~= nil and not st.replaying then
+          local seq = { "v" }
+          for _, k in ipairs(keys) do
+            seq[#seq + 1] = k
+          end
+          seq[#seq + 1] = "r"
+          seq[#seq + 1] = value
+          st.rep = { kind = "keys", keys = seq }
+        end
+        st.key_seq = {}
+      else
+        exit_visual(st)
+      end
+      res.handled = true
+      return res
+    end
+    vstate.clear_pending(st)
+    res.handled = true
+    return res
+  end
+
+  -- u/U: case-convert the selection in place (one undo unit).
+  if not ctrl and (key == "u" or key == "U") then
+    local span = visual_span(buf, st)
+    if span ~= nil and span.stop > span.start then
+      local slice = buf.text:sub(span.start + 1, span.stop)
+      local out
+      if key == "u" then
+        out = slice:lower()
+      else
+        out = slice:upper()
+      end
+      apply_edit(buf, res, {
+        start = span.start, stop = span.stop, text = out, cursor = span.start,
+      })
+      local keys = st.visual_keys
+      exit_visual(st)
+      commit_change(st, buf, res, before)
+      if keys ~= nil and not st.replaying then
+        local seq = { "v" }
+        for _, k in ipairs(keys) do
+          seq[#seq + 1] = k
+        end
+        seq[#seq + 1] = key
+        st.rep = { kind = "keys", keys = seq }
+      end
+      st.key_seq = {}
+    else
+      exit_visual(st)
+    end
+    res.handled = true
+    return res
+  end
+
+  -- ~: toggle case across the selection.
+  if key == "~" and not ctrl then
+    local span = visual_span(buf, st)
+    if span ~= nil and span.stop > span.start then
+      local parts = {}
+      local off = span.start
+      while off < span.stop do
+        local nxt = motions.char_next(buf.text, off)
+        if nxt > span.stop then
+          nxt = span.stop
+        end
+        local ch = buf.text:sub(off + 1, nxt)
+        local lo = ch:lower()
+        local up = ch:upper()
+        if ch == lo and ch ~= up then
+          parts[#parts + 1] = up
+        elseif ch == up and ch ~= lo then
+          parts[#parts + 1] = lo
+        else
+          parts[#parts + 1] = ch
+        end
+        off = nxt
+      end
+      apply_edit(buf, res, {
+        start = span.start, stop = span.stop,
+        text = table.concat(parts), cursor = span.start,
+      })
+      local keys = st.visual_keys
+      exit_visual(st)
+      commit_change(st, buf, res, before)
+      if keys ~= nil and not st.replaying then
+        local seq = { "v" }
+        for _, k in ipairs(keys) do
+          seq[#seq + 1] = k
+        end
+        seq[#seq + 1] = "~"
+        st.rep = { kind = "keys", keys = seq }
+      end
+      st.key_seq = {}
+    else
+      exit_visual(st)
+    end
+    res.handled = true
+    return res
+  end
+
+  -- p/P: replace the selection with the register.
+  if not ctrl and (key == "p" or key == "P") then
+    local reg = motions.counted_register(st.register, vstate.take_count(st, 1))
+    local span = visual_span(buf, st)
+    if reg ~= nil and span ~= nil then
+      local old = buf.text:sub(span.start + 1, span.stop)
+      apply_edit(buf, res, {
+        start = span.start, stop = span.stop, text = reg.text, cursor = span.start,
+      })
+      st.register = { text = old, linewise = false }
+      local keys = st.visual_keys
+      exit_visual(st)
+      commit_change(st, buf, res, before)
+      if keys ~= nil and not st.replaying then
+        local seq = { "v" }
+        for _, k in ipairs(keys) do
+          seq[#seq + 1] = k
+        end
+        seq[#seq + 1] = key
+        st.rep = { kind = "keys", keys = seq }
+      end
+      st.key_seq = {}
+    else
+      exit_visual(st)
+      vstate.clear_count(st)
+    end
+    res.handled = true
+    return res
+  end
+
+  -- J: join the selected lines.
+  if key == "J" and not ctrl then
+    local span = visual_span(buf, st)
+    if span ~= nil then
+      local s = motions.line_start(buf.text, span.start)
+      local e = motions.line_end(buf.text, math.max(s, span.stop - 1))
+      local slice = buf.text:sub(s + 1, e)
+      local joined = slice:gsub("\n%s*", " ")
+      apply_edit(buf, res, { start = s, stop = e, text = joined, cursor = s })
+      local keys = st.visual_keys
+      exit_visual(st)
+      commit_change(st, buf, res, before)
+      if keys ~= nil and not st.replaying then
+        local seq = { "v" }
+        for _, k in ipairs(keys) do
+          seq[#seq + 1] = k
+        end
+        seq[#seq + 1] = "J"
+        st.rep = { kind = "keys", keys = seq }
+      end
+      st.key_seq = {}
+    else
+      exit_visual(st)
+    end
+    res.handled = true
+    return res
+  end
+
+  -- counts: apply to the following motion.
+  if not ctrl and ((key >= "1" and key <= "9") or (key == "0" and st.count ~= "")) then
+    vstate.append_count_digit(st, key)
+    res.handled = true
+    return res
+  end
+
+  -- gg: extend to the prompt start.
+  if key == "g" and not ctrl then
+    if st.pending == "g" then
+      vstate.clear_pending(st)
+      buf.cursor = 0
+      snap_cursor(buf)
+      visual_track_key(st, "g")
+      visual_track_key(st, "g")
+      res.handled = true
+      res.cursor_only = true
+      return res
+    end
+    vstate.set_pending(st, "g", st.count .. "g")
+    res.handled = true
+    return res
+  end
+  if st.pending == "g" then
+    vstate.clear_pending(st)
+    res.handled = true
+    return res
+  end
+
+  -- selection motions.
+  if not ctrl and visual_motion(st, buf, key, vstate.take_count(st, 1)) then
+    visual_track_key(st, key)
+    if buf.cursor ~= before.cursor then
+      res.cursor_only = true
+    end
+    res.handled = true
+    return res
+  end
+
+  if is_printable(ev) then
+    -- unhandled printable: keep the selection, swallow the key.
+    res.handled = true
+    return res
+  end
+  res.handled = false
+  return res
+end
+
 
 local function dispatch_normal(st, buf, res, ev, before)
   local key = ev.key
@@ -1283,10 +1900,29 @@ local function dispatch_normal(st, buf, res, ev, before)
     return res
   end
 
-  -- visual mode is cut for v1: no-op with a note
-  if (key == "v" or key == "V") and not ctrl then
+  -- enter visual / visual-line mode (emulated: anchor in Lua).
+  if key == "v" and not ctrl then
+    st.mode = "visual"
+    st.visual_anchor = buf.cursor
+    st.visual_line_anchor = nil
+    st.visual_keys = {}
+    vstate.clear_pending(st)
+    vstate.clear_count(st)
     res.handled = true
-    res.flash = "visual mode is not supported in the prompt (v1)"
+    res.cursor_only = true
+    return res
+  end
+  if key == "V" and not ctrl then
+    st.mode = "visual_line"
+    st.visual_line_anchor = motions.line_start(buf.text, buf.cursor)
+    st.visual_anchor = nil
+    st.visual_keys = {}
+    vstate.clear_pending(st)
+    vstate.clear_count(st)
+    buf.cursor = st.visual_line_anchor
+    snap_cursor(buf)
+    res.handled = true
+    res.cursor_only = true
     return res
   end
 
@@ -1631,6 +2267,19 @@ function H.handle(st, buf, ev)
       res.handled = true
       return res
     end
+    return res
+  end
+
+  -- visual modes: motions extend the anchor; operators consume it.
+  -- key_seq is untouched (visual records its own repeat via visual_keys).
+  if st.mode == "visual" or st.mode == "visual_line" then
+    local before = snap_of(buf)
+    local res = new_result(false)
+    dispatch_visual(st, buf, res, ev, before)
+    if res.handled and st.count ~= "" and st.pending == "" and not res.count_key then
+      vstate.clear_count(st)
+    end
+    res.count_key = nil
     return res
   end
 

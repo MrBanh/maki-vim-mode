@@ -18,13 +18,19 @@
 --   * <CR> is deliberately left unbound: native submit works in both modes,
 --     matching upstream's default (normal-Enter submits).
 --
--- Scope (v1, prompt-only, same as upstream):
---   MUST (delivered): normal/insert/replace modes, hjkl + arrows, wbe/WBE,
---   0$^_, fFtT + ;/,, counts, operators c/d/y + cc/dd/yy, text objects
---   iw/aw/iW/aW/quotes/brackets, x/s/C/D/o/O/i/a/I/A/R/r, p/P with
---   charwise/linewise registers, internal registers, u/<C-r> undo-redo
---   (self-contained snapshot stacks), dot-repeat, /vim toggle,
---   status-hint indicator. Starts in insert mode (upstream default).
+-- Scope (prompt-only, same as upstream):
+--   Delivered: normal/insert/replace/visual/visual-line modes, hjkl +
+--   arrows, wbe/WBE, 0$^_, fFtT + ;/,, counts, operators c/d/y + cc/dd/yy,
+--   text objects iw/aw/iW/aW/quotes/brackets, x/s/C/D/o/O/i/a/I/A/R/r,
+--   p/P with charwise/linewise registers, internal registers,
+--   u/<C-r> undo-redo (self-contained snapshot stacks), dot-repeat,
+--   /vim toggle, status-hint indicator with per-mode colors. Starts in
+--   insert mode (upstream default).
+--   Visual is emulated: no host selection/highlight API exists, so the
+--   anchor lives in Lua and the range shows in the hint ("-- VISUAL -- 3c",
+--   "-- V-LINE -- 2L"). v/V enter/toggle, o swaps ends, motions extend,
+--   y/d/c/x/s/r/u/U/~/p/P/J operate, text objects reselect. No
+--   highlight and no block cursor (no cursor-style API).
 --   Optional via M.setup(opts) (defaults preserve the behavior above):
 --   escape_sequence ("jk" two-key escape from insert, via InputChanged),
 --   langmap (pressed-key remap at the top of on_key), normal_leader +
@@ -33,8 +39,8 @@
 --   insert_after_submit = false (fresh-prompt resets keep normal mode),
 --   system_clipboard_register (yank/delete mirror to the system clipboard,
 --   p/P paste from it). Without setup() every option stays at its default.
---   CUT (documented): visual mode (`v` no-ops with a flash note),
---   block cursor (no cursor-style API), gj/gk (degrade to j/k), `:`
+--   CUT (documented): selection highlight + block cursor (no cursor-style
+--   or selection API on the host), gj/gk (degrade to j/k), `:`
 --   commands (':' inserts '/' at column 0 and enters insert mode),
 --   H/M/L viewport jumps, C-w window navigation.
 --
@@ -53,7 +59,12 @@
 --     enter_submit = true,             -- false: <CR> inserts a newline
 --     insert_after_submit = true,      -- false: resets keep normal mode
 --     system_clipboard_register = true,
+--     mode_styles = { normal = "warning" }, -- theme style per vim mode
 --   })
+--   mode_styles keys: normal/insert/replace/visual/visual_line; values are
+--   theme style names ("accent", "success", "warning", "error", "dim", ...).
+--   Defaults: normal=warning, insert=success, replace=error,
+--   visual(+line)=accent.
 --
 -- Key pipeline notes (verified against maki-ui/src/app/mod.rs):
 --   * Bindings are GLOBAL: they no-op cheaply when the input is not live
@@ -96,6 +107,20 @@ local cfg = {
   enter_submit = true, -- false: bind <CR> in insert to insert a newline
   insert_after_submit = true, -- false: fresh-prompt resets keep normal mode
   system_clipboard_register = false, -- yank/delete mirror to system clipboard
+  mode_styles = nil, -- nil = defaults below; else { normal=?, insert=?, replace=?, visual=?, visual_line=? }
+}
+
+-- Semantic theme names (see maki-ui/src/theme.rs style_by_name). Per-mode
+-- indicator colors; unknown names resolve to the default style, so any
+-- theme stays readable. Bold variants would need inline tables, which the
+-- host hint store does not accept -- it keeps Vec<(String, String)> -- so
+-- plain semantic names are the ceiling here.
+local MODE_STYLES = {
+  normal = "warning", -- yellow-ish (todo_in_progress)
+  insert = "success", -- green-ish (todo_completed)
+  replace = "error", -- red
+  visual = "accent", -- orange-ish theme accent
+  visual_line = "accent",
 }
 
 -- one-key leader prefix armed while waiting for the key after the leader
@@ -210,7 +235,9 @@ local function detect_clipboard_tool()
 end
 
 -- jobstart has no stdin support, so writes pipe through sh (powershell
--- takes the text as an argument instead).
+-- takes the text as an argument instead). Key callbacks have no active
+-- task, so both directions pass scope = "plugin" (the default "task"
+-- scope dies with the dispatch and the write never lands).
 local function clipboard_write_argv(tool, text)
   if tool.name == "powershell" then
     return { "powershell", "-NoProfile", "-NonInteractive", "-Command",
@@ -274,9 +301,9 @@ local function clipboard_write_text(text)
   if argv == nil then
     return
   end
-  local pok, id = pcall(maki.fn.jobstart, argv, { stdout = false, stderr = false })
+  local pok, id = pcall(maki.fn.jobstart, argv, { stdout = false, stderr = false, scope = "plugin" })
   if not pok or id == nil then
-    maki.log.debug("vim-mode: clipboard write spawn failed")
+    maki.log.debug("vim-mode: clipboard write spawn failed: " .. tostring(id))
   end
 end
 
@@ -292,7 +319,7 @@ local function clipboard_read_text()
   if argv == nil then
     return nil
   end
-  local pok, id = pcall(maki.fn.jobstart, argv, {})
+  local pok, id = pcall(maki.fn.jobstart, argv, { scope = "plugin" })
   if not pok or id == nil then
     maki.log.debug("vim-mode: clipboard read spawn failed")
     return nil
@@ -418,13 +445,92 @@ local function write_edit(e, version, session_id)
   })
 end
 
+local function mode_style()
+  local m = state.mode
+  if cfg.mode_styles ~= nil and cfg.mode_styles[m] ~= nil then
+    return cfg.mode_styles[m]
+  end
+  return MODE_STYLES[m] or ""
+end
+
+-- Selection summary for visual modes: "3c" / "2L" / line range.
+-- Computed here (not in state) because it needs the buffer text.
+local function visual_summary()
+  local cur = nil
+  if last_known.text ~= nil then
+    cur = { text = last_known.text, cursor = last_known.cursor or 0 }
+  else
+    cur = read_input()
+    if cur == nil then
+      return ""
+    end
+  end
+  local text = cur.text
+  local cursor = cur.cursor
+  if state.mode == "visual_line" then
+    local anchor = state.visual_line_anchor
+    if anchor == nil then
+      return ""
+    end
+    local a_line = vim_motions.line_start(text, anchor)
+    local c_line = vim_motions.line_start(text, cursor)
+    local s = math.min(a_line, c_line)
+    local e = vim_motions.line_end(text, math.max(a_line, c_line))
+    if e <= s then
+      return ""
+    end
+    -- count lines in [s, e)
+    local n = 1
+    local off = s
+    while true do
+      local nl = text:find("\n", off + 1, true)
+      if nl == nil or nl > e then
+        break
+      end
+      n = n + 1
+      off = nl
+    end
+    if n == 1 then
+      return "1L"
+    end
+    return n .. "L"
+  end
+  local anchor = state.visual_anchor
+  if anchor == nil then
+    return ""
+  end
+  local s = math.min(anchor, cursor)
+  local e = math.max(anchor, cursor)
+  if s == e and #text == 0 then
+    return ""
+  end
+  e = vim_motions.char_next(text, e)
+  local n = e - s
+  if n <= 0 then
+    return ""
+  end
+  return n .. "c"
+end
+
 local function update_hint()
   if not enabled then
     maki.ui.set_status_hint(nil)
     return
   end
   local mode_label, ctx = vim_state.indicator(state)
-  maki.ui.set_status_hint({ { mode_label, ctx } })
+  if state.mode == "visual" or state.mode == "visual_line" then
+    local sel = visual_summary()
+    if sel ~= "" then
+      ctx = sel
+    else
+      ctx = ""
+    end
+  end
+  if ctx ~= nil and ctx ~= "" then
+    maki.ui.set_status_hint({ { mode_label, mode_style() }, { " " .. ctx, "" } })
+  else
+    maki.ui.set_status_hint({ { mode_label, mode_style() } })
+  end
 end
 
 -- ---------------------------------------------------------------------------
@@ -444,7 +550,7 @@ local function desired_keys()
     end
     return MINIMAL_KEYS_NO_SUBMIT
   end
-  return FULL_KEYS -- normal + replace share the full set
+  return FULL_KEYS -- normal + replace + visual share the full set
 end
 
 local function sync_bindings()
@@ -664,8 +770,9 @@ local function on_key(key, ctrl)
   end
 
   -- p/P with the system clipboard: prefer the clipboard, fall back silent.
-  if cfg.system_clipboard_register and state.mode == "normal" and not ctrl
-    and (key == "p" or key == "P") then
+  if cfg.system_clipboard_register
+    and (state.mode == "normal" or state.mode == "visual" or state.mode == "visual_line")
+    and not ctrl and (key == "p" or key == "P") then
     local clip_text = clipboard_read_text()
     if clip_text ~= nil then
       state.register = { text = clip_text, linewise = false }
@@ -904,15 +1011,21 @@ maki.api.create_autocmd("InputChanged", {
       -- native typing (e.g. Enter) inside replace mode: record for repeat
       vim_handler.note_external_insert(state, last_known.text, d.text)
     end
-    if state.mode == "normal" and last_known.version ~= nil and d.text ~= last_known.text then
-      -- external write while in normal mode (e.g. bracketed paste, which no
-      -- binding can intercept): make it a self-contained undo unit so `u`
-      -- reverts it instead of losing history coherence.
+    if (state.mode == "normal" or state.mode == "visual" or state.mode == "visual_line")
+      and last_known.version ~= nil and d.text ~= last_known.text then
+      -- external write while in normal/visual mode (e.g. bracketed paste,
+      -- which no binding can intercept): make it a self-contained undo unit
+      -- so `u` reverts it instead of losing history coherence.
       vim_state.push(
         state,
         { text = last_known.text, cursor = last_known.cursor },
         { text = d.text, cursor = tonumber(d.cursor) or 0 }
       )
+      if state.mode == "visual" or state.mode == "visual_line" then
+        vim_state.set_mode(state, "normal")
+        sync_bindings()
+        update_hint()
+      end
     end
     last_known = { text = d.text, cursor = tonumber(d.cursor) or 0, version = d.version }
   end,
@@ -994,6 +1107,9 @@ function M.setup(opts)
   end
   if type(opts.system_clipboard_register) == "boolean" then
     cfg.system_clipboard_register = opts.system_clipboard_register
+  end
+  if type(opts.mode_styles) == "table" then
+    cfg.mode_styles = opts.mode_styles
   end
   esc_prev = nil
   leader_armed = false

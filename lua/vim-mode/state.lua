@@ -2,8 +2,9 @@
 -- Port of the prompt-relevant subset of opencode-vim's src/vim/state.ts.
 -- Pure Lua, no maki dependency (unit-testable with plain lua).
 --
--- Modes: "normal" | "insert" | "replace". Visual/copy modes are cut for v1
--- (no selection/highlight API on the host side).
+-- Modes: "normal" | "insert" | "replace" | "visual" | "visual_line".
+-- Visual is emulated: no host selection/highlight API exists, so the anchor
+-- lives in Lua (st.visual.anchor) and the range shows in the status hint.
 -- Pending keys: "" | "c" | "d" | "g" | "f" | "F" | "t" | "T" | "y" | "r".
 -- Offsets everywhere are 0-based byte offsets (matches maki.ui.input).
 
@@ -40,6 +41,9 @@ function M.new(initial_mode)
     replace_start = nil, -- cursor where R was pressed
     replace_typed = false,
     replace_edits = nil, -- list of { kind = "rep"|"ins", rel, text }
+    visual_anchor = nil, -- 0-based offset where v/V was pressed | nil
+    visual_line_anchor = nil, -- line-start offset where V was pressed | nil
+    visual_keys = nil, -- keys pressed in visual mode (for dot-repeat)
   }
 end
 
@@ -90,6 +94,13 @@ function M.snapshot(st)
       replace_edits[i] = { kind = e.kind, rel = e.rel, text = e.text }
     end
   end
+  local visual_keys = nil
+  if st.visual_keys ~= nil then
+    visual_keys = {}
+    for i, k in ipairs(st.visual_keys) do
+      visual_keys[i] = k
+    end
+  end
   return {
     mode = st.mode,
     pending = st.pending,
@@ -119,6 +130,9 @@ function M.snapshot(st)
     replace_start = st.replace_start,
     replace_typed = st.replace_typed,
     replace_edits = replace_edits,
+    visual_anchor = st.visual_anchor,
+    visual_line_anchor = st.visual_line_anchor,
+    visual_keys = visual_keys,
   }
 end
 
@@ -147,6 +161,9 @@ function M.restore(st, snap)
   st.replace_start = snap.replace_start
   st.replace_typed = snap.replace_typed
   st.replace_edits = snap.replace_edits
+  st.visual_anchor = snap.visual_anchor
+  st.visual_line_anchor = snap.visual_line_anchor
+  st.visual_keys = snap.visual_keys
 end
 
 function M.set_pending(st, next, display)
@@ -204,6 +221,11 @@ function M.set_mode(st, next)
   if next ~= "replace" then
     st.replace_start = nil
     st.replace_typed = false
+  end
+  if next ~= "visual" and next ~= "visual_line" then
+    st.visual_anchor = nil
+    st.visual_line_anchor = nil
+    st.visual_keys = nil
   end
   st.mode = next
 end
@@ -292,7 +314,11 @@ function M.is_normal(st)
   return st.mode == "normal"
 end
 
--- Status-hint text, mirroring upstream indicator.ts (minus visual/copy).
+function M.is_visual(st)
+  return st.mode == "visual" or st.mode == "visual_line"
+end
+
+-- Status-hint text, mirroring upstream indicator.ts (minus copy mode).
 -- Always returns mode_label, context (pending display / count / "").
 -- The label is never nil: set_status_hint rejects pairs with a missing key.
 function M.indicator(st)
@@ -301,6 +327,10 @@ function M.indicator(st)
     label = "-- INSERT --"
   elseif st.mode == "replace" then
     label = "-- REPLACE --"
+  elseif st.mode == "visual" then
+    label = "-- VISUAL --"
+  elseif st.mode == "visual_line" then
+    label = "-- V-LINE --"
   end
   if st.pending ~= "" then
     return label, (st.pending_display ~= "" and st.pending_display or st.pending) .. ".."
