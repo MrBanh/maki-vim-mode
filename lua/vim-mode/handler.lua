@@ -114,6 +114,16 @@ local function start_operator(st, op)
   vstate.set_pending(st, op, display)
 end
 
+-- Tag the unnamed register with how it was written so the integration
+-- layer can mirror selectively (clipboard = "yank" mirrors yanks only).
+-- kind: "yank" | "delete" | "change" | "paste".
+local function set_register(st, reg, kind)
+  if reg == nil then
+    return
+  end
+  st.register = { text = reg.text, linewise = reg.linewise, kind = kind }
+end
+
 local function line_motion_anchor(text, cursor, direction, count)
   local c = cursor
   for _ = 1, count do
@@ -230,7 +240,7 @@ end
 
 local function apply_op_yank(st, result)
   if result.register ~= nil then
-    st.register = { text = result.register.text, linewise = result.register.linewise }
+    set_register(st, result.register, "yank")
   end
   vstate.clear_pending(st)
 end
@@ -251,7 +261,13 @@ local function apply_op_edit(st, buf, res, result_fn, operation, before)
     end
   end
   if next.register ~= nil then
-    st.register = { text = next.register.text, linewise = next.register.linewise }
+    local kind = "delete"
+    if operation == "y" then
+      kind = "yank"
+    elseif operation == "c" then
+      kind = "change"
+    end
+    set_register(st, next.register, kind)
   end
   vstate.clear_pending(st)
   if operation == "c" then
@@ -426,7 +442,7 @@ local function vertical_motion_operator(st, buf, res, key, operation, before)
   if operation == "y" then
     local result = yank_line_motion(buf, direction, count)
     if result.register ~= nil then
-      st.register = { text = result.register.text, linewise = result.register.linewise }
+      set_register(st, result.register, "yank")
     end
     vstate.clear_pending(st)
     return true
@@ -445,7 +461,7 @@ local function vertical_motion_operator(st, buf, res, key, operation, before)
     if reg == nil then
       return true
     end
-    st.register = { text = reg.text, linewise = reg.linewise }
+    set_register(st, reg, "delete")
     commit_change(st, buf, res, before)
     return true
   end
@@ -463,7 +479,7 @@ local function vertical_motion_operator(st, buf, res, key, operation, before)
   if reg == nil then
     return true
   end
-  st.register = { text = reg.text, linewise = reg.linewise }
+  set_register(st, reg, "change")
   enter_insert(st, buf, res, {}, before)
   return true
 end
@@ -654,7 +670,7 @@ local function doubled_operator(st, buf, res, op, before)
     if r ~= nil then
       setup = { r.edit }
       if r.register ~= nil then
-        st.register = { text = r.register.text, linewise = r.register.linewise }
+        set_register(st, r.register, "change")
       end
     end
     vstate.clear_pending(st)
@@ -670,14 +686,14 @@ local function doubled_operator(st, buf, res, op, before)
     end
     apply_edit(buf, res, r.edit)
     if r.register ~= nil then
-      st.register = { text = r.register.text, linewise = r.register.linewise }
+      set_register(st, r.register, "delete")
     end
     commit_change(st, buf, res, before)
     return
   end
   local result = motions.yank_line_count(buf.text, buf.cursor, take_op_count(st))
   if result.register ~= nil then
-    st.register = { text = result.register.text, linewise = result.register.linewise }
+    set_register(st, result.register, "yank")
   end
   vstate.clear_pending(st)
 end
@@ -971,7 +987,11 @@ local function visual_apply(st, buf, res, before, enter_insert_after)
   if linewise and slice ~= "" and slice:sub(-1) ~= "\n" then
     reg_text = slice .. "\n"
   end
-  st.register = { text = reg_text, linewise = linewise }
+  if enter_insert_after then
+    set_register(st, { text = reg_text, linewise = linewise }, "change")
+  else
+    set_register(st, { text = reg_text, linewise = linewise }, "delete")
+  end
   local keys = st.visual_keys
   local was_line = st.mode == "visual_line"
   -- linewise delete/change eats the trailing newline, matching dd/cc.
@@ -1258,7 +1278,7 @@ local function dispatch_visual(st, buf, res, ev, before)
       if linewise and slice ~= "" and slice:sub(-1) ~= "\n" then
         reg_text = slice .. "\n"
       end
-      st.register = { text = reg_text, linewise = linewise }
+      set_register(st, { text = reg_text, linewise = linewise }, "yank")
     end
     local keys = st.visual_keys
     local was_line = st.mode == "visual_line"
@@ -1420,7 +1440,7 @@ local function dispatch_visual(st, buf, res, ev, before)
       apply_edit(buf, res, {
         start = span.start, stop = span.stop, text = reg.text, cursor = span.start,
       })
-      st.register = { text = old, linewise = false }
+      set_register(st, { text = old, linewise = false }, "paste")
       local keys = st.visual_keys
       exit_visual(st)
       commit_change(st, buf, res, before)
@@ -1554,7 +1574,7 @@ local function dispatch_normal(st, buf, res, ev, before)
           cursor = off + 1
         end
         apply_edit(buf, res, { start = off, stop = off, text = value, cursor = cursor })
-        st.register = { text = r.register.text, linewise = r.register.linewise }
+        set_register(st, r.register, "change")
         vstate.clear_pending(st)
         commit_change(st, buf, res, before)
       else
@@ -1852,7 +1872,7 @@ local function dispatch_normal(st, buf, res, ev, before)
     if r ~= nil then
       setup = { r.edit }
       if r.register ~= nil then
-        st.register = { text = r.register.text, linewise = r.register.linewise }
+        set_register(st, r.register, "change")
       end
     end
     vstate.clear_pending(st)
@@ -1866,7 +1886,7 @@ local function dispatch_normal(st, buf, res, ev, before)
     if r ~= nil then
       apply_edit(buf, res, r.edit)
       if r.register ~= nil then
-        st.register = { text = r.register.text, linewise = r.register.linewise }
+        set_register(st, r.register, "delete")
       end
       commit_change(st, buf, res, before)
     end
@@ -1880,7 +1900,7 @@ local function dispatch_normal(st, buf, res, ev, before)
     if r ~= nil then
       setup = { r.edit }
       if r.register ~= nil then
-        st.register = { text = r.register.text, linewise = r.register.linewise }
+        set_register(st, r.register, "change")
       end
     end
     enter_insert(st, buf, res, setup, before)
@@ -2110,7 +2130,7 @@ local function dispatch_normal(st, buf, res, ev, before)
       -- upstream keeps the cursor where the char was
       setup = { { start = r.edit.start, stop = r.edit.stop, text = "", cursor = before.cursor } }
       if r.register ~= nil then
-        st.register = { text = r.register.text, linewise = r.register.linewise }
+        set_register(st, r.register, "change")
       end
     end
     enter_insert(st, buf, res, setup, before)
@@ -2123,7 +2143,7 @@ local function dispatch_normal(st, buf, res, ev, before)
     if r ~= nil then
       apply_edit(buf, res, r.edit)
       if r.register ~= nil then
-        st.register = { text = r.register.text, linewise = r.register.linewise }
+        set_register(st, r.register, "delete")
       end
       commit_change(st, buf, res, before)
     end

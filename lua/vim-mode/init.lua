@@ -37,15 +37,17 @@
 --   normal_keybinds (one-key leader prefix running slash commands),
 --   enter_submit = false (bind <CR> in insert to insert a newline),
 --   insert_after_submit = false (fresh-prompt resets keep normal mode),
---   system_clipboard_register (yank/delete mirror to the system clipboard,
---   p/P paste from it). Without setup() every option stays at its default.
+--   clipboard ("all"/"yank"/"never", default "never"): which unnamed
+--   writes mirror to the system clipboard (and seed p/P from it).
+--   system_clipboard_register = true is the legacy spelling of "all".
+--   Without setup() every option stays at its default.
 --   CUT (documented): selection highlight + block cursor (no cursor-style
 --   or selection API on the host), gj/gk (degrade to j/k), `:`
 --   commands (':' inserts '/' at column 0 and enters insert mode),
 --   H/M/L viewport jumps, C-w window navigation.
 --
 -- Permissions: keymap/ui/autocmd/command APIs are ungated. The defaults
--- touch no maki.fn job APIs; system_clipboard_register probes clipboard
+-- touch no maki.fn job APIs; clipboard = "all"/"yank" probes clipboard
 -- tools via maki.fn.executable and shells out via maki.fn.jobstart, which
 -- the package plugin.toml grants (run + fs_read).
 --
@@ -58,9 +60,10 @@
 --     normal_keybinds = { ["<leader>s"] = "/sessions" }, -- bare "s" also ok
 --     enter_submit = true,             -- false: <CR> inserts a newline
 --     insert_after_submit = true,      -- false: resets keep normal mode
---     system_clipboard_register = true,
+--     clipboard = "yank", -- or "all" | "never"
 --     mode_styles = { normal = "warning" }, -- theme style per vim mode
 --   })
+--   system_clipboard_register = true is still accepted as clipboard = "all".
 --   mode_styles keys: normal/insert/replace/visual/visual_line; values are
 --   theme style names ("accent", "success", "warning", "error", "dim", ...).
 --   Defaults: normal=warning, insert=success, replace=error,
@@ -106,7 +109,8 @@ local cfg = {
   normal_keybinds = {}, -- e.g. { ["<leader>s"] = "/sessions" }
   enter_submit = true, -- false: bind <CR> in insert to insert a newline
   insert_after_submit = true, -- false: fresh-prompt resets keep normal mode
-  system_clipboard_register = false, -- yank/delete mirror to system clipboard
+  system_clipboard_register = false, -- legacy spelling of clipboard = "all"
+  clipboard = nil, -- nil = unset; "all" | "yank" | "never" (see header)
   mode_styles = nil, -- nil = defaults below; else { normal=?, insert=?, replace=?, visual=?, visual_line=? }
 }
 
@@ -122,6 +126,49 @@ local MODE_STYLES = {
   visual = "accent", -- orange-ish theme accent
   visual_line = "accent",
 }
+
+-- Clipboard mode resolution. An explicit clipboard value wins; otherwise
+-- the legacy system_clipboard_register = true maps to "all"; default "never".
+local function clipboard_mode()
+  if cfg.clipboard == "all" or cfg.clipboard == "yank" or cfg.clipboard == "never" then
+    return cfg.clipboard
+  end
+  if cfg.system_clipboard_register then
+    return "all"
+  end
+  return "never"
+end
+
+local function clipboard_on()
+  return clipboard_mode() ~= "never"
+end
+
+-- Should an unnamed write of this kind mirror outward? "all" mirrors every
+-- unnamed write; "yank" mirrors yanks only; "never" mirrors nothing.
+-- Non-mirrored writes stay local for p / P.
+local function should_mirror(kind)
+  local mode = clipboard_mode()
+  if mode == "all" then
+    return true
+  end
+  if mode == "yank" then
+    return kind == "yank"
+  end
+  return false
+end
+
+-- May p/P seed the register from the system clipboard? Only when the
+-- current content is mirror-eligible (or there is none): a local delete
+-- under clipboard = "yank" must survive for p instead of being clobbered.
+local function should_prefetch(reg)
+  if not clipboard_on() then
+    return false
+  end
+  if reg == nil then
+    return true
+  end
+  return should_mirror(reg.kind)
+end
 
 -- one-key leader prefix armed while waiting for the key after the leader
 local leader_armed = false
@@ -287,7 +334,7 @@ local function job_stdout_text(res)
 end
 
 local function clipboard_write_text(text)
-  if not cfg.system_clipboard_register then
+  if not clipboard_on() then
     return
   end
   if type(text) ~= "string" or text == "" then
@@ -308,7 +355,7 @@ local function clipboard_write_text(text)
 end
 
 local function clipboard_read_text()
-  if not cfg.system_clipboard_register then
+  if not clipboard_on() then
     return nil
   end
   local tool = detect_clipboard_tool()
@@ -770,9 +817,11 @@ local function on_key(key, ctrl)
   end
 
   -- p/P with the system clipboard: prefer the clipboard, fall back silent.
-  if cfg.system_clipboard_register
-    and (state.mode == "normal" or state.mode == "visual" or state.mode == "visual_line")
-    and not ctrl and (key == "p" or key == "P") then
+  -- Only when the current register is mirror-eligible; non-mirrored
+  -- writes (e.g. a local delete under clipboard = "yank") stay local.
+  if (state.mode == "normal" or state.mode == "visual" or state.mode == "visual_line")
+    and not ctrl and (key == "p" or key == "P")
+    and should_prefetch(state.register) then
     local clip_text = clipboard_read_text()
     if clip_text ~= nil then
       state.register = { text = clip_text, linewise = false }
@@ -852,11 +901,13 @@ local function on_key(key, ctrl)
 
   last_known = { text = buf.text, cursor = buf.cursor, version = cur.version }
 
-  -- yank/delete mirror to the system clipboard (fire-and-forget).
-  if cfg.system_clipboard_register and state.register ~= nil then
+  -- mirror the unnamed register to the system clipboard (fire-and-forget).
+  if clipboard_on() and state.register ~= nil then
     local before_text = saved.register ~= nil and saved.register.text or nil
     if state.register.text ~= before_text then
-      clipboard_write_text(state.register.text)
+      if should_mirror(state.register.kind) then
+        clipboard_write_text(state.register.text)
+      end
     end
   end
 
@@ -1107,6 +1158,13 @@ function M.setup(opts)
   end
   if type(opts.system_clipboard_register) == "boolean" then
     cfg.system_clipboard_register = opts.system_clipboard_register
+  end
+  if type(opts.clipboard) == "string" then
+    if opts.clipboard == "all" or opts.clipboard == "yank" or opts.clipboard == "never" then
+      cfg.clipboard = opts.clipboard
+    else
+      maki.log.debug("vim-mode: ignoring bad clipboard value " .. opts.clipboard)
+    end
   end
   if type(opts.mode_styles) == "table" then
     cfg.mode_styles = opts.mode_styles

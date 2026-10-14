@@ -3,6 +3,9 @@
 -- Pure Lua, no maki dependency (unit-testable with plain lua).
 --
 -- Modes: "normal" | "insert" | "replace" | "visual" | "visual_line".
+-- Register: { text, linewise, kind } where kind is "yank" | "delete" |
+-- "change" | "paste" | nil (nil = legacy/test state, mirrors like a yank
+-- under clipboard = "all" and never under "yank").
 -- Visual is emulated: no host selection/highlight API exists, so the anchor
 -- lives in Lua (st.visual.anchor) and the range shows in the status hint.
 -- Pending keys: "" | "c" | "d" | "g" | "f" | "F" | "t" | "T" | "y" | "r".
@@ -62,7 +65,7 @@ local function copy_register(reg)
   if reg == nil then
     return nil
   end
-  return { text = reg.text, linewise = reg.linewise }
+  return { text = reg.text, linewise = reg.linewise, kind = reg.kind }
 end
 
 -- Deep-ish copy for the read->compute->write retry path: a failed write
