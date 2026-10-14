@@ -537,15 +537,21 @@ local function visual_summary()
       n = n + 1
       off = nl
     end
-    if n == 1 then
-      return "1L"
+    local backward = c_line < a_line
+    local prefix = ""
+    if backward then
+      prefix = "-"
     end
-    return n .. "L"
+    if n == 1 then
+      return prefix .. "1L"
+    end
+    return prefix .. n .. "L"
   end
   local anchor = state.visual_anchor
   if anchor == nil then
     return ""
   end
+  local backward = cursor < anchor
   local s = math.min(anchor, cursor)
   local e = math.max(anchor, cursor)
   if s == e and #text == 0 then
@@ -556,6 +562,9 @@ local function visual_summary()
   if n <= 0 then
     return ""
   end
+  if backward then
+    return "-" .. n .. "c"
+  end
   return n .. "c"
 end
 
@@ -565,16 +574,19 @@ local function update_hint()
     return
   end
   local mode_label, ctx = vim_state.indicator(state)
+  local ctx_style = ""
   if state.mode == "visual" or state.mode == "visual_line" then
     local sel = visual_summary()
     if sel ~= "" then
       ctx = sel
+      -- selection size tracks the mode color (sign shows direction).
+      ctx_style = mode_style()
     else
       ctx = ""
     end
   end
   if ctx ~= nil and ctx ~= "" then
-    maki.ui.set_status_hint({ { mode_label, mode_style() }, { " " .. ctx, "" } })
+    maki.ui.set_status_hint({ { mode_label, mode_style() }, { " " .. ctx, ctx_style } })
   else
     maki.ui.set_status_hint({ { mode_label, mode_style() } })
   end
