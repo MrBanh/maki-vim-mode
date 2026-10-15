@@ -32,7 +32,8 @@
 --   y/d/c/x/s/r/u/U/~/p/P/J operate, text objects reselect. No
 --   highlight and no block cursor (no cursor-style API).
 --   Optional via M.setup(opts) (defaults preserve the behavior above):
---   escape_sequence ("jk" two-key escape from insert, via InputChanged),
+--   escape_sequence ("jk" two-key escape from insert, via InputChanged at
+--   any cursor position) + escape_timeout_ms (default 200ms wall clock),
 --   langmap (pressed-key remap at the top of on_key), normal_leader +
 --   normal_keybinds (one-key leader prefix running slash commands),
 --   enter_submit = false (bind <CR> in insert to insert a newline),
@@ -54,7 +55,7 @@
 -- Options reference (all fields optional):
 --   setup({
 --     escape_sequence = "jk",          -- string|nil (exactly 2 bytes)
---     escape_timeout_ms = 750,         -- max gap between the two keys
+--     escape_timeout_ms = 200,         -- max gap (ms) between the two keys
 --     langmap = { H = "^", L = "$" },  -- pressed key -> matched identity
 --     normal_leader = "space",         -- "space"/"<Space>" (or any 1 key)
 --     normal_keybinds = { ["<leader>s"] = "/sessions" }, -- bare "s" also ok
@@ -98,7 +99,7 @@ local M = {}
 -- user options (M.setup is defined at the end so it sees every local)
 -- ---------------------------------------------------------------------------
 
-local DEFAULT_ESCAPE_TIMEOUT_MS = 750
+local DEFAULT_ESCAPE_TIMEOUT_MS = 200
 local CLIP_READ_TIMEOUT_MS = 1000
 
 local cfg = {
@@ -173,19 +174,44 @@ end
 -- one-key leader prefix armed while waiting for the key after the leader
 local leader_armed = false
 -- last single-char insert-mode insertion for escape_sequence detection
-local esc_prev = nil -- { char, t } | nil
+-- (works at any cursor position, not just end-of-input). The pending first
+-- key expires via maki.defer_fn after escape_timeout_ms (wall clock), so no
+-- os.clock dependency and no false trigger after long pauses.
+local esc_prev = nil -- { char, pos } | nil (pos = 0-based insertion start)
+local esc_timer = nil -- maki.defer_fn handle for the pending expiry | nil
+local esc_gen = 0 -- generation counter to ignore stale timer callbacks
 
--- clock for the escape gap; os.time (1s resolution) fallback, nil if none
-local clock_fn = nil
-do
-  if type(os) == "table" then
-    if type(os.clock) == "function" then
-      clock_fn = os.clock
-    elseif type(os.time) == "function" then
-      clock_fn = function()
-        return os.time()
-      end
+-- Cancel a pending escape first-key (timer + state). Safe to call anytime.
+local function esc_reset()
+  esc_prev = nil
+  esc_gen = esc_gen + 1
+  if esc_timer ~= nil then
+    pcall(function()
+      esc_timer:stop()
+    end)
+    esc_timer = nil
+  end
+end
+
+-- Arm a pending escape first-key, (re)starting the wall-clock expiry timer.
+local function esc_arm(char, pos)
+  esc_gen = esc_gen + 1
+  local gen = esc_gen
+  esc_prev = { char = char, pos = pos }
+  if esc_timer ~= nil then
+    pcall(function()
+      esc_timer:stop()
+    end)
+    esc_timer = nil
+  end
+  local ok, handle = pcall(maki.defer_fn, function()
+    if esc_gen == gen then
+      esc_prev = nil
+      esc_timer = nil
     end
+  end, cfg.escape_timeout_ms)
+  if ok and handle ~= nil then
+    esc_timer = handle
   end
 end
 
@@ -389,20 +415,32 @@ local function clipboard_read_text()
   return text
 end
 
--- Exactly-one-UTF-8-char appended at the end (old must be a prefix of new)?
--- Returns the added char or nil. Multi-char appends (pastes) return nil.
-local function single_appended_char(old_text, new_text)
+-- Single insertion at any cursor position (typing, not paste/delete)?
+-- Returns the inserted string + its 0-based start offset, or nil.
+-- Requires the cursor to advance with the insertion (old_cur -> new_cur),
+-- which native typing always does; cursor-only moves and pastes return nil.
+local function extract_insertion(old_text, old_cur, new_text, new_cur)
   if #new_text <= #old_text then
     return nil
   end
-  if new_text:sub(1, #old_text) ~= old_text then
+  local li = #new_text - #old_text
+  if new_cur - old_cur ~= li then
     return nil
   end
-  local added = new_text:sub(#old_text + 1)
-  if vim_motions.char_next(added, 0) ~= #added then
+  local p = old_cur
+  if p < 0 or p > #old_text then
     return nil
   end
-  return added
+  if new_cur < li or new_cur > #new_text then
+    return nil
+  end
+  if old_text:sub(1, p) ~= new_text:sub(1, p) then
+    return nil
+  end
+  if old_text:sub(p + 1) ~= new_text:sub(p + li + 1) then
+    return nil
+  end
+  return new_text:sub(p + 1, p + li), p
 end
 
 -- ---------------------------------------------------------------------------
@@ -634,6 +672,40 @@ local function sync_bindings()
   end
 end
 
+-- Shared escape writer: delete the `seq` at seq_start (0-based byte offset),
+-- run a real escape through the core so undo/repeat bookkeeping matches.
+-- Works at any cursor position; cursor lands where the sequence started
+-- (matching an <Esc> pressed before the sequence). Returns true when the
+-- write landed (caller must return early).
+local function do_escape_write(d, seq_start, seq_len)
+  local stripped = d.text:sub(1, seq_start) .. d.text:sub(seq_start + seq_len + 1)
+  local buf = { text = stripped, cursor = seq_start }
+  local saved = vim_state.snapshot(state)
+  local ok, res = pcall(vim_handler.handle, state, buf, { key = "escape", ctrl = false })
+  if ok and res.handled then
+    local wok, _ = write_edit(
+      { start = 0, stop = #d.text, text = buf.text, cursor = buf.cursor },
+      d.version,
+      d.session_id
+    )
+    if wok then
+      esc_reset()
+      local fresh = read_input()
+      if fresh ~= nil and fresh.text == buf.text then
+        last_known = { text = fresh.text, cursor = fresh.cursor, version = fresh.version }
+      else
+        last_known = { text = buf.text, cursor = buf.cursor, version = d.version }
+      end
+      sync_bindings()
+      update_hint()
+      return true
+    end
+  end
+  vim_state.restore(state, saved)
+  last_known = { text = d.text, cursor = tonumber(d.cursor) or 0, version = d.version }
+  return false
+end
+
 -- ---------------------------------------------------------------------------
 -- transcript scroll / jump (gg/G on empty prompt, C-d/u/f/b/e/y)
 -- ---------------------------------------------------------------------------
@@ -697,7 +769,7 @@ local function on_session_id(sid)
   vim_state.set_mode(state, fresh_mode())
   state.key_seq = {}
   leader_armed = false
-  esc_prev = nil
+  esc_reset()
   sync_bindings()
   update_hint()
 end
@@ -767,6 +839,8 @@ local function on_key(key, ctrl)
           cursor = e.cursor,
           version = cur.version,
         }
+        -- own edit shifts offsets: drop any pending escape first-key.
+        esc_reset()
         sync_bindings()
         update_hint()
         permit:release()
@@ -913,6 +987,12 @@ local function on_key(key, ctrl)
 
   last_known = { text = buf.text, cursor = buf.cursor, version = cur.version }
 
+  -- any mode transition invalidates a pending escape first-key (its offsets
+  -- belong to the previous insert session).
+  if saved.mode ~= state.mode then
+    esc_reset()
+  end
+
   -- mirror the unnamed register to the system clipboard (fire-and-forget).
   if clipboard_on() and state.register ~= nil then
     local before_text = saved.register ~= nil and saved.register.text or nil
@@ -969,7 +1049,7 @@ local function set_enabled(on)
   vim_state.reset(state)
   state.key_seq = {}
   leader_armed = false
-  esc_prev = nil
+  esc_reset()
   sync_bindings()
   update_hint()
   if on then
@@ -1021,54 +1101,48 @@ maki.api.create_autocmd("InputChanged", {
       end
     end
     if not enabled then
-      esc_prev = nil
-    elseif cfg.escape_sequence ~= nil and clock_fn ~= nil and state.mode == "insert" then
-      local at_end = (tonumber(d.cursor) or 0) == #d.text
-        and (tonumber(last_known.cursor) or 0) == #(last_known.text or "")
-      local added = single_appended_char(last_known.text or "", d.text)
-      if added ~= nil and at_end then
-        local now = clock_fn()
-        local seq = cfg.escape_sequence
-        if esc_prev ~= nil
-          and (now - esc_prev.t) * 1000 <= cfg.escape_timeout_ms
-          and esc_prev.char .. added == seq
-          and d.text:sub(-#seq) == seq then
-          esc_prev = nil
-          -- two consecutive single-char appends completed the sequence at
-          -- end-of-text: delete both chars and run a real escape through
-          -- the core so undo/repeat bookkeeping matches.
-          local stripped = d.text:sub(1, #d.text - #seq)
-          local buf = { text = stripped, cursor = #stripped }
-          local saved = vim_state.snapshot(state)
-          local ok, res = pcall(vim_handler.handle, state, buf, { key = "escape", ctrl = false })
-          if ok and res.handled then
-            local wok, _ = write_edit(
-              { start = 0, stop = #d.text, text = buf.text, cursor = buf.cursor },
-              d.version,
-              d.session_id
-            )
-            if wok then
-              local fresh = read_input()
-              if fresh ~= nil and fresh.text == buf.text then
-                last_known = { text = fresh.text, cursor = fresh.cursor, version = fresh.version }
-              else
-                last_known = { text = buf.text, cursor = buf.cursor, version = d.version }
-              end
-              sync_bindings()
-              update_hint()
-              return
-            end
-          end
-          vim_state.restore(state, saved)
-          last_known = { text = d.text, cursor = tonumber(d.cursor) or 0, version = d.version }
-          return
-        end
-        esc_prev = { char = added, t = now }
+      esc_reset()
+    elseif cfg.escape_sequence ~= nil and state.mode == "insert" then
+      if d.cursor_only then
+        -- caret move without text change cancels a pending first key.
+        esc_reset()
       else
-        esc_prev = nil
+        local seq = cfg.escape_sequence
+        local old_text = last_known.text or ""
+        local old_cur = tonumber(last_known.cursor) or 0
+        local new_cur = tonumber(d.cursor) or 0
+        local ins, ipos = extract_insertion(old_text, old_cur, d.text, new_cur)
+        if ins == nil then
+          esc_reset()
+        elseif ins == seq then
+          -- both keys landed in one frame (fast typing): escape immediately.
+          if do_escape_write(d, ipos, #seq) then
+            return
+          end
+          return
+        elseif vim_motions.char_next(ins, 0) ~= #ins then
+          -- multi-char paste (not the sequence): cancel pending.
+          esc_reset()
+        elseif esc_prev ~= nil
+          and esc_prev.char .. ins == seq
+          and esc_prev.pos + #esc_prev.char == ipos then
+          local seq_start = esc_prev.pos
+          if do_escape_write(d, seq_start, #seq) then
+            return
+          end
+          return
+        else
+          -- not completing: keep a new pending only if this char can
+          -- start the sequence (e.g. "j" for "jk"); otherwise clear.
+          if #ins < #seq and ins == seq:sub(1, #ins) then
+            esc_arm(ins, ipos)
+          else
+            esc_reset()
+          end
+        end
       end
     elseif state.mode ~= "insert" then
-      esc_prev = nil
+      esc_reset()
     end
     if state.mode == "replace" and last_known.text ~= nil and d.text ~= last_known.text then
       -- native typing (e.g. Enter) inside replace mode: record for repeat
@@ -1104,7 +1178,7 @@ local function reset_for_fresh_prompt(ev)
     vim_state.set_mode(state, fresh_mode())
     state.key_seq = {}
     leader_armed = false
-    esc_prev = nil
+    esc_reset()
     sync_bindings()
     update_hint()
   end
@@ -1136,11 +1210,7 @@ function M.setup(opts)
   end
   if opts.escape_sequence ~= nil then
     if type(opts.escape_sequence) == "string" and #opts.escape_sequence == 2 then
-      if clock_fn ~= nil then
-        cfg.escape_sequence = opts.escape_sequence
-      else
-        maki.log.debug("vim-mode: no os clock, escape_sequence disabled")
-      end
+      cfg.escape_sequence = opts.escape_sequence
     else
       maki.log.debug("vim-mode: escape_sequence must be a 2-byte string")
     end
@@ -1181,7 +1251,7 @@ function M.setup(opts)
   if type(opts.mode_styles) == "table" then
     cfg.mode_styles = opts.mode_styles
   end
-  esc_prev = nil
+  esc_reset()
   leader_armed = false
   sync_bindings()
   update_hint()

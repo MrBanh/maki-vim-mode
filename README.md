@@ -83,7 +83,7 @@ Every field is optional; without `setup()` all defaults hold. Defaults:
 ```lua
 {
   escape_sequence = nil,      -- e.g. "jk": two-key escape from insert (exactly 2 bytes)
-  escape_timeout_ms = 750,    -- max gap (ms) between the two keys
+  escape_timeout_ms = 200,    -- max gap (ms) between the two keys
   langmap = {},               -- pressed key -> matched identity, e.g. { H = "^", L = "$" }
   normal_leader = nil,        -- one-key leader prefix, e.g. "space" / "<Space>"
   normal_keybinds = {},       -- e.g. { ["<leader>s"] = "/sessions" } (bare "s" also ok)
@@ -96,8 +96,8 @@ Every field is optional; without `setup()` all defaults hold. Defaults:
 
 | Option | Meaning |
 |---|---|
-| `escape_sequence` | Two-key escape from insert (e.g. `"jk"`), detected via `InputChanged`. Must be exactly 2 bytes. |
-| `escape_timeout_ms` | Max gap between the two keys. |
+| `escape_sequence` | Two-key escape from insert (e.g. `"jk"`), detected via `InputChanged` at any cursor position. Must be exactly 2 bytes. |
+| `escape_timeout_ms` | Max gap (ms, wall clock) between the two keys. Default `200`. Set e.g. `150` for a snappier escape or `500` for more forgiveness. |
 | `langmap` | Remap pressed keys before matching, e.g. `{ H = "^", L = "$" }`. |
 | `normal_leader` | One-key prefix in normal mode (`"space"`, `"<Space>"`, or any single key). The next key runs a slash command. Counts never apply to leader sequences. |
 | `normal_keybinds` | Map of `"<leader>x"` (or bare `"x"`) to slash commands. |
